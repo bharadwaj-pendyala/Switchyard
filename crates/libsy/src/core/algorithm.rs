@@ -683,6 +683,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overflow_history_bounds_subagents_and_clears_the_whole_session() {
+        let evictions = SessionEvictions::default();
+        for index in 0..=MAX_EVICTION_IDENTITIES {
+            let identity = RoutingIdentity::Subagent {
+                session: "shared-session".to_string(),
+                agent: format!("agent-{index}"),
+            };
+            evictions.record(Some(&identity), "small-context-model");
+        }
+
+        assert_eq!(evictions.by_identity.lock().len(), MAX_EVICTION_IDENTITIES);
+        evictions.remove_session("shared-session");
+        assert!(evictions.by_identity.lock().is_empty());
+    }
+
     /// Build a routed decision for orchestration tests.
     fn test_decision(selected_model_id: String) -> Decision {
         Decision::new(selected_model_id, None, true)
