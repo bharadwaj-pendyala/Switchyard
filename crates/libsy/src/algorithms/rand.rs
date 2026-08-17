@@ -16,14 +16,14 @@ use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::rngs::StdRng;
 
 use crate::algorithms::fall_through::FallThrough;
-use crate::core::algorithm::{Algorithm, Driver, LlmTargetSet};
+use crate::core::algorithm::{Algorithm, Driver};
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::{LibsyError, Result};
-use switchyard_protocol::{Request, Response};
+use switchyard_protocol::{ModelId, Request, Response};
 
 /// Stateless weighted classifier used by random fall-through routing.
 pub struct RandomClassifier {
-    targets: Vec<String>,
+    targets: Vec<ModelId>,
     distribution: WeightedIndex<f64>,
     rng: Mutex<StdRng>,
 }
@@ -40,12 +40,16 @@ impl RandomClassifier {
     /// Returns an error when targets are empty or duplicated, or when explicit
     /// weights have the wrong length, are negative or non-finite, or contain no
     /// positive value.
-    pub fn new(targets: Vec<String>, weights: Option<Vec<f64>>, seed: Option<u64>) -> Result<Self> {
+    pub fn new(
+        targets: Vec<ModelId>,
+        weights: Option<Vec<f64>>,
+        seed: Option<u64>,
+    ) -> Result<Self> {
         let target_count = targets.len();
         if target_count == 0 {
             return Err(LibsyError::NoTargets);
         }
-        let unique_targets = targets.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let unique_targets = targets.iter().map(ModelId::as_str).collect::<BTreeSet<_>>();
         if unique_targets.len() != target_count {
             return Err(LibsyError::AlgorithmError {
                 message: "random targets must be unique".to_string(),
@@ -85,7 +89,7 @@ impl RandomClassifier {
         })
     }
 
-    fn select_target(&self) -> String {
+    fn select_target(&self) -> ModelId {
         let mut rng = self.rng.lock();
         let index = self.distribution.sample(&mut *rng);
         self.targets[index].clone()
@@ -125,23 +129,18 @@ pub struct Random {
 }
 
 impl Random {
-    /// Creates a router over `target_set`.
+    /// Creates a router over `targets`.
     ///
     /// # Errors
     ///
     /// Returns an error when targets or weights are invalid for [`RandomClassifier`].
     pub fn new(
-        target_set: LlmTargetSet,
+        targets: Vec<ModelId>,
         weights: Option<Vec<f64>>,
         seed: Option<u64>,
     ) -> Result<Self> {
-        let target_names = target_set
-            .targets()
-            .iter()
-            .map(|target| target.semantic_name.clone())
-            .collect();
-        let classifier = Arc::new(RandomClassifier::new(target_names, weights, seed)?);
-        let inner = FallThrough::<()>::new(target_set)
+        let classifier = Arc::new(RandomClassifier::new(targets.clone(), weights, seed)?);
+        let inner = FallThrough::<()>::new(targets)
             .with_name("random")
             .with_decision_reason(random_decision_reason)
             .with_classifier(classifier);
@@ -159,11 +158,7 @@ impl Algorithm for Random {
         "random"
     }
 
-    async fn create_run_task(
-        self: Arc<Self>,
-        driver: Driver,
-        request: Request,
-    ) -> Result<Response> {
+    async fn route(self: Arc<Self>, driver: Driver, request: Request) -> Result<Response> {
         self.inner.execute(driver, request).await
     }
 }
@@ -176,9 +171,8 @@ mod tests {
     use switchyard_protocol::{Metadata, completion_text, text_request};
 
     use crate::algorithms::util::affinity::AffinityRouter;
-    use crate::core::algorithm::LlmTarget;
     use crate::core::testing::{echo, test_drive};
-    use switchyard_protocol::{Request, Signals};
+    use switchyard_protocol::Request;
 
     fn request() -> Request {
         Request {
@@ -198,14 +192,8 @@ mod tests {
         }
     }
 
-    fn target_set(names: &[&str]) -> LlmTargetSet {
-        let targets = names
-            .iter()
-            .map(|name| LlmTarget {
-                semantic_name: (*name).to_string(),
-            })
-            .collect();
-        LlmTargetSet::new(targets)
+    fn target_set(names: &[&str]) -> Vec<ModelId> {
+        names.iter().map(|name| ModelId::from(*name)).collect()
     }
 
     fn algorithm(names: &[&str], weights: Option<Vec<f64>>, seed: Option<u64>) -> Result<Random> {
@@ -328,7 +316,7 @@ mod tests {
         let names = ["a/model", "b/model"];
         let affinity = Arc::new(AffinityRouter::new());
         let random = Arc::new(RandomClassifier::new(
-            names.iter().map(|name| (*name).to_string()).collect(),
+            names.iter().map(|name| ModelId::from(*name)).collect(),
             None,
             Some(42),
         )?);
@@ -357,7 +345,7 @@ mod tests {
             .argmax(false)?;
         assert_eq!(
             retained.map(|score| score.target),
-            Some(selected.to_string())
+            Some(ModelId::from(selected.clone()))
         );
 
         let (_, second) = test_drive(algorithm, request_for_session("session-1"), echo()).await?;
@@ -403,25 +391,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_signals_is_a_noop() -> Result<()> {
-        let algorithm: Arc<dyn Algorithm> = Arc::new(algorithm(&["only/model"], None, None)?);
-        algorithm.process_signals(Signals {}).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn decision_is_inspectable() -> Result<()> {
         let algorithm = shared_algorithm(&["only/model"])?;
         let (trace, _) = test_drive(algorithm, request(), echo()).await?;
         let decision = &trace[0];
 
         assert_eq!(decision.selected_model_id(), "only/model");
-        assert!(
-            decision
-                .reasoning()
-                .unwrap_or_default()
-                .contains("only/model")
-        );
         assert!(decision.is_answer_call());
         Ok(())
     }

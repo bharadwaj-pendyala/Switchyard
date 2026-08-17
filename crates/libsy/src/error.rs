@@ -5,7 +5,7 @@
 
 use std::error::Error as StdError;
 
-use switchyard_protocol::LlmClientError;
+use switchyard_protocol::{LlmClientError, ModelId};
 use thiserror::Error;
 
 /// Result type returned by libsy APIs.
@@ -17,8 +17,8 @@ pub enum LibsyError {
     /// A named target was not present in the configured target set.
     #[error("target {target:?} was not found")]
     TargetNotFound {
-        /// Missing semantic target name.
-        target: String,
+        /// Missing target model id.
+        target: ModelId,
     },
 
     /// Routing was attempted without any configured targets.
@@ -36,14 +36,6 @@ pub enum LibsyError {
     #[error(transparent)]
     Driver(#[from] DriverError),
 
-    /// The spawned algorithm task failed before returning normally.
-    #[error("algorithm task failed: {source}")]
-    AlgorithmTask {
-        /// Tokio task failure, including panic and unexpected cancellation details.
-        #[from]
-        source: tokio::task::JoinError,
-    },
-
     /// An algorithm's step stream ended without a terminal response.
     #[error("algorithm run ended without a final response")]
     MissingFinalResponse,
@@ -52,15 +44,11 @@ pub enum LibsyError {
     #[error("client call to target {target:?} failed: {source}")]
     ClientCall {
         /// Target whose client failed.
-        target: String,
+        target: ModelId,
         /// Typed error supplied by the protocol-owned client trait.
         #[source]
         source: LlmClientError,
     },
-
-    /// Every target overflowed its context window.
-    #[error("every target exceeded its context window")]
-    AllTargetsExcluded,
 
     /// A user extension or other foreign operation failed.
     #[error("{operation} failed: {source}")]
@@ -75,7 +63,7 @@ pub enum LibsyError {
 
 impl LibsyError {
     /// Wrap an error returned by the protocol-owned client trait.
-    pub fn client_call(target: impl Into<String>, source: LlmClientError) -> Self {
+    pub fn client_call(target: impl Into<ModelId>, source: LlmClientError) -> Self {
         Self::ClientCall {
             target: target.into(),
             source,
@@ -95,7 +83,7 @@ impl LibsyError {
 }
 
 /// Failures in the step-stream driver.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum DriverError {
     /// The consumer side of the step channel was dropped.
     #[error("driver stream is closed")]

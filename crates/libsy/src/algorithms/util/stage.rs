@@ -28,6 +28,7 @@ use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::{State, StateValue};
 use crate::observability::meter;
+use switchyard_protocol::ModelId;
 use switchyard_protocol::Request;
 
 /// Turn depth below which stall signals stay quiet — early no-write turns are
@@ -62,6 +63,11 @@ const EXPLORING_METRIC: &str = "switchyard.stage_router.exploring";
 /// Distribution of production-oriented tool activity.
 const PRODUCTION_INTENSITY_METRIC: &str = "switchyard.stage_router.production_intensity";
 
+// Histogram boundaries live with the instruments so every host exports the
+// same stage-router distributions without duplicating algorithm knowledge.
+const SCORE_BUCKETS: &[f64] = &[-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0];
+const UNIT_BUCKETS: &[f64] = &[0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+
 /// The two tiers a turn can route to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tier {
@@ -91,13 +97,13 @@ impl Tier {
 /// reaches the right model.
 #[derive(Clone, Debug)]
 pub struct StageTargets {
-    capable: String,
-    efficient: String,
+    capable: ModelId,
+    efficient: ModelId,
 }
 
 impl StageTargets {
     /// Name the targets the two tiers route to.
-    pub fn new(capable: impl Into<String>, efficient: impl Into<String>) -> Self {
+    pub fn new(capable: impl Into<ModelId>, efficient: impl Into<ModelId>) -> Self {
         Self {
             capable: capable.into(),
             efficient: efficient.into(),
@@ -105,7 +111,7 @@ impl StageTargets {
     }
 
     /// The target `tier` routes to.
-    pub fn name(&self, tier: Tier) -> &str {
+    pub fn name(&self, tier: Tier) -> &ModelId {
         match tier {
             Tier::Capable => &self.capable,
             Tier::Efficient => &self.efficient,
@@ -113,10 +119,10 @@ impl StageTargets {
     }
 
     /// The tier label for a routed target, or `None` for one outside the pair.
-    pub fn label_for(&self, target: &str) -> Option<&'static str> {
-        if target == self.capable {
+    pub fn label_for(&self, target: &ModelId) -> Option<&'static str> {
+        if *target == self.capable {
             Some(Tier::Capable.label())
-        } else if target == self.efficient {
+        } else if *target == self.efficient {
             Some(Tier::Efficient.label())
         } else {
             None
@@ -288,15 +294,23 @@ fn record_score_metrics(signal: &ToolSignals, outcome: &PickOutcome) {
     };
     let dimensions = dimensions_from_signal(signal);
     let meter = meter();
-    for (name, value) in [
-        (SCORE_METRIC, score),
-        (CONFIDENCE_METRIC, confidence),
-        (SEVERITY_METRIC, dimensions.severity),
-        (SPINNING_METRIC, dimensions.spinning),
-        (EXPLORING_METRIC, dimensions.exploring),
-        (PRODUCTION_INTENSITY_METRIC, dimensions.production_intensity),
+    for (name, value, boundaries) in [
+        (SCORE_METRIC, score, SCORE_BUCKETS),
+        (CONFIDENCE_METRIC, confidence, UNIT_BUCKETS),
+        (SEVERITY_METRIC, dimensions.severity, UNIT_BUCKETS),
+        (SPINNING_METRIC, dimensions.spinning, UNIT_BUCKETS),
+        (EXPLORING_METRIC, dimensions.exploring, UNIT_BUCKETS),
+        (
+            PRODUCTION_INTENSITY_METRIC,
+            dimensions.production_intensity,
+            UNIT_BUCKETS,
+        ),
     ] {
-        meter.f64_histogram(name).build().record(value, &[]);
+        meter
+            .f64_histogram(name)
+            .with_boundaries(boundaries.to_vec())
+            .build()
+            .record(value, &[]);
     }
 }
 
@@ -529,7 +543,7 @@ impl StageClassifier {
 
 #[async_trait]
 impl Classifier<State> for StageClassifier {
-    fn routing_tier(&self, selected_model_id: &str) -> Option<&'static str> {
+    fn routing_tier(&self, selected_model_id: &ModelId) -> Option<&'static str> {
         self.targets.label_for(selected_model_id)
     }
 
@@ -565,7 +579,7 @@ impl Classifier<State> for StageClassifier {
                 let conf = score.abs();
                 Ok((
                     Classification::Scores(vec![Score {
-                        target: target.to_string(),
+                        target: target.clone(),
                         confidence: conf,
                     }]),
                     None,

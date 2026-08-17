@@ -101,10 +101,10 @@ upper classifier and stage thresholds (1.0). The config is validated with
 `switchyard-server --dry-run` before either service starts.
 
 The runner does not invent operational maxima for unbounded values such as target count or recent
-turn window. Focused Rust tests cover the real bounded structures at cap plus one: 1,024 routing
-overflow identities, 4,096 affinity assignments, 100,000 retained latency samples, and 10,000
-recorded error details. Server tests cover invalid thresholds, malformed classifier verdicts,
-missing subagent identifiers, target failures, and the retry value immediately above the maximum.
+turn window. Focused Rust tests cover the real bounded structures at cap plus one: 4,096 affinity
+assignments, 100,000 retained latency samples, and 10,000 recorded error details. Server tests
+cover invalid thresholds, malformed classifier verdicts, missing subagent identifiers, target
+failures, and the retry value immediately above the maximum.
 
 ## Run the 48-hour test
 

@@ -7,9 +7,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
+use prometheus::Registry;
 use serde::Serialize;
 
+use super::algorithms::{AlgorithmStats, AlgorithmStatsSnapshot};
 use super::cache_eligibility::PrefixProbe;
+use switchyard_protocol::ModelId;
 
 const MAX_LATENCY_SAMPLES: usize = 10_000;
 
@@ -25,14 +28,30 @@ pub(crate) struct TokenUsage {
 }
 
 /// Thread-safe process-local stats store.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub(crate) struct StatsAccumulator {
     inner: Arc<Mutex<StatsAccumulatorInner>>,
 }
 
+impl Default for StatsAccumulator {
+    fn default() -> Self {
+        Self::new(Registry::new(), std::iter::empty())
+    }
+}
+
 impl StatsAccumulator {
+    /// Creates a stats store for the supplied algorithm names.
+    pub(crate) fn new<'a>(
+        registry: Registry,
+        algorithms: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(StatsAccumulatorInner::new(registry, algorithms))),
+        }
+    }
+
     /// Records one successful routed backend call.
-    pub(crate) fn record_success(&self, model: impl Into<String>, backend_latency_ms: f64) {
+    pub(crate) fn record_success(&self, model: impl Into<ModelId>, backend_latency_ms: f64) {
         let mut inner = self.lock();
         inner.total_requests = inner.total_requests.saturating_add(1);
         let stats = inner.model_stats_mut(model.into());
@@ -41,7 +60,7 @@ impl StatsAccumulator {
     }
 
     /// Records one failed routed backend call.
-    pub(crate) fn record_error(&self, model: impl Into<String>) {
+    pub(crate) fn record_error(&self, model: impl Into<ModelId>) {
         let mut inner = self.lock();
         inner.total_requests = inner.total_requests.saturating_add(1);
         inner.total_errors = inner.total_errors.saturating_add(1);
@@ -50,7 +69,7 @@ impl StatsAccumulator {
     }
 
     /// Records a stream failure after its routed call was already counted.
-    pub(crate) fn record_stream_error(&self, model: impl Into<String>) {
+    pub(crate) fn record_stream_error(&self, model: impl Into<ModelId>) {
         let mut inner = self.lock();
         inner.total_errors = inner.total_errors.saturating_add(1);
         let stats = inner.model_stats_mut(model.into());
@@ -60,7 +79,7 @@ impl StatsAccumulator {
     /// Records usage and terminal latency after a successful routed call.
     pub(crate) fn record_usage(
         &self,
-        model: impl Into<String>,
+        model: impl Into<ModelId>,
         usage: TokenUsage,
         total_latency_ms: f64,
     ) {
@@ -78,7 +97,7 @@ impl StatsAccumulator {
     /// Records one successful classifier or judge call.
     pub(crate) fn record_classifier_success(
         &self,
-        model: impl Into<String>,
+        model: impl Into<ModelId>,
         usage: Option<TokenUsage>,
         latency_ms: f64,
     ) {
@@ -94,7 +113,7 @@ impl StatsAccumulator {
     }
 
     /// Records one failed classifier or judge call.
-    pub(crate) fn record_classifier_error(&self, model: impl Into<String>) {
+    pub(crate) fn record_classifier_error(&self, model: impl Into<ModelId>) {
         let mut inner = self.lock();
         inner.classifier_requests = inner.classifier_requests.saturating_add(1);
         inner.classifier_errors = inner.classifier_errors.saturating_add(1);
@@ -103,9 +122,9 @@ impl StatsAccumulator {
     }
 
     /// Returns the cache-eligible fraction for `model` and records the prefix as seen.
-    pub(crate) fn prefix_eligibility(&self, model: &str, probe: &PrefixProbe) -> f64 {
+    pub(crate) fn prefix_eligibility(&self, model: &ModelId, probe: &PrefixProbe) -> f64 {
         let mut inner = self.lock();
-        let stats = inner.model_stats_mut(model.to_string());
+        let stats = inner.model_stats_mut(model.clone());
         let fraction = probe.eligible_fraction(&stats.seen_prefixes);
         if let Some(hash) = probe.full_hash() {
             stats.seen_prefixes.insert(hash);
@@ -115,13 +134,12 @@ impl StatsAccumulator {
 
     /// Returns a serializable point-in-time snapshot.
     pub(crate) fn snapshot(&self) -> StatsSnapshot {
-        let inner = self.lock().clone();
-        inner.snapshot()
+        self.lock().snapshot()
     }
 
     /// Clears all accumulated stats.
     pub(crate) fn reset(&self) {
-        *self.lock() = StatsAccumulatorInner::default();
+        self.lock().reset();
     }
 
     fn lock(&self) -> MutexGuard<'_, StatsAccumulatorInner> {
@@ -129,24 +147,38 @@ impl StatsAccumulator {
     }
 }
 
-#[derive(Clone, Debug, Default)]
 struct StatsAccumulatorInner {
-    by_model: BTreeMap<String, ModelStats>,
+    by_model: BTreeMap<ModelId, ModelStats>,
     total_requests: u64,
     total_errors: u64,
     routing_overhead: LatencyHistogram,
     routing_fallbacks: RoutingFallbackStats,
-    by_classifier: BTreeMap<String, ModelStats>,
+    by_classifier: BTreeMap<ModelId, ModelStats>,
     classifier_requests: u64,
     classifier_errors: u64,
+    algorithm_stats: AlgorithmStats,
 }
 
 impl StatsAccumulatorInner {
-    fn model_stats_mut(&mut self, model: String) -> &mut ModelStats {
+    fn new<'a>(registry: Registry, algorithms: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            by_model: BTreeMap::new(),
+            total_requests: 0,
+            total_errors: 0,
+            routing_overhead: LatencyHistogram::default(),
+            routing_fallbacks: RoutingFallbackStats::default(),
+            by_classifier: BTreeMap::new(),
+            classifier_requests: 0,
+            classifier_errors: 0,
+            algorithm_stats: AlgorithmStats::new(registry, algorithms),
+        }
+    }
+
+    fn model_stats_mut(&mut self, model: ModelId) -> &mut ModelStats {
         self.by_model.entry(model).or_default()
     }
 
-    fn classifier_stats_mut(&mut self, model: String) -> &mut ModelStats {
+    fn classifier_stats_mut(&mut self, model: ModelId) -> &mut ModelStats {
         self.by_classifier.entry(model).or_default()
     }
 
@@ -165,7 +197,20 @@ impl StatsAccumulatorInner {
             routing_overhead: self.routing_overhead.snapshot(),
             routing_fallbacks: self.routing_fallbacks,
             classifier,
+            algorithm_stats: self.algorithm_stats.snapshot(),
         }
+    }
+
+    fn reset(&mut self) {
+        self.by_model.clear();
+        self.total_requests = 0;
+        self.total_errors = 0;
+        self.routing_overhead = LatencyHistogram::default();
+        self.routing_fallbacks = RoutingFallbackStats::default();
+        self.by_classifier.clear();
+        self.classifier_requests = 0;
+        self.classifier_errors = 0;
+        self.algorithm_stats.reset();
     }
 }
 
@@ -271,15 +316,16 @@ pub(crate) struct StatsSnapshot {
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_tokens: TokenTotals,
-    pub models: BTreeMap<String, ModelStatsSnapshot>,
+    pub models: BTreeMap<ModelId, ModelStatsSnapshot>,
     pub routing_overhead: LatencyHistogramSnapshot,
     pub routing_fallbacks: RoutingFallbackStats,
     pub classifier: ClassifierStatsSnapshot,
+    pub algorithm_stats: AlgorithmStatsSnapshot,
 }
 
 /// Legacy fallback counters retained in the stats response shape.
 ///
-/// New decisions carry fallback details in their reasoning instead.
+/// New fallback details are logged instead.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct RoutingFallbackStats {
     pub context_window: u64,
@@ -291,7 +337,7 @@ pub(crate) struct ClassifierStatsSnapshot {
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_tokens: TokenTotals,
-    pub models: BTreeMap<String, ModelStatsSnapshot>,
+    pub models: BTreeMap<ModelId, ModelStatsSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -337,9 +383,9 @@ pub(crate) struct LatencyHistogramSnapshot {
 }
 
 fn build_model_snapshots(
-    by_model: &BTreeMap<String, ModelStats>,
+    by_model: &BTreeMap<ModelId, ModelStats>,
     total_requests: u64,
-) -> (BTreeMap<String, ModelStatsSnapshot>, TokenTotals) {
+) -> (BTreeMap<ModelId, ModelStatsSnapshot>, TokenTotals) {
     let mut totals = TokenTotals::default();
     for stats in by_model.values() {
         totals.prompt = totals.prompt.saturating_add(stats.prompt_tokens);
@@ -385,7 +431,7 @@ fn build_model_snapshots(
 }
 
 fn build_classifier_snapshot(
-    models: &BTreeMap<String, ModelStats>,
+    models: &BTreeMap<ModelId, ModelStats>,
     total_requests: u64,
     total_errors: u64,
 ) -> ClassifierStatsSnapshot {
@@ -491,12 +537,15 @@ mod tests {
         let probe = prefix_probe(&json!({
             "messages": [{"role": "user", "content": "repeat me"}],
         }));
-        stats.prefix_eligibility("model/a", &probe);
+        stats.prefix_eligibility(&ModelId::from("model/a"), &probe);
 
         stats.reset();
 
         assert_eq!(stats.snapshot(), StatsSnapshot::default());
-        assert_eq!(stats.prefix_eligibility("model/a", &probe), 0.0);
+        assert_eq!(
+            stats.prefix_eligibility(&ModelId::from("model/a"), &probe),
+            0.0
+        );
     }
 
     #[test]
@@ -505,7 +554,7 @@ mod tests {
         let first = prefix_probe(&json!({
             "messages": [{"role": "user", "content": "aaaa"}],
         }));
-        let first_eligible = stats.prefix_eligibility("model/a", &first);
+        let first_eligible = stats.prefix_eligibility(&ModelId::from("model/a"), &first);
         stats.record_usage(
             "model/a",
             TokenUsage {
@@ -521,7 +570,7 @@ mod tests {
                 {"role": "user", "content": "bbbb"},
             ],
         }));
-        let second_eligible = stats.prefix_eligibility("model/a", &second);
+        let second_eligible = stats.prefix_eligibility(&ModelId::from("model/a"), &second);
         stats.record_usage(
             "model/a",
             TokenUsage {
@@ -537,6 +586,9 @@ mod tests {
             stats.snapshot().models["model/a"].theoretical_cache_hit_rate,
             0.25
         );
-        assert_eq!(stats.prefix_eligibility("model/b", &second), 0.0);
+        assert_eq!(
+            stats.prefix_eligibility(&ModelId::from("model/b"), &second),
+            0.0
+        );
     }
 }

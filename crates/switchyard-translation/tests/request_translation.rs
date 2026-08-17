@@ -5,7 +5,9 @@
 
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
-use switchyard_translation::{TranslationEngine, TranslationPolicy, WireFormat};
+use switchyard_translation::{
+    LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -307,6 +309,211 @@ fn anthropic_tool_result_followup_text_splits_to_openai_messages() -> TestResult
             {"role": "user", "content": "Now summarize it."}
         ])
     );
+    Ok(())
+}
+
+// Verifies Anthropic multimodal blocks retain provider fields inside tool results.
+#[test]
+fn anthropic_tool_result_multimodal_blocks_round_trip_complete() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let document = json!({
+        "type": "document",
+        "title": "report.pdf",
+        "context": "Quarterly results",
+        "citations": {"enabled": true},
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "ZG9jdW1lbnQ="
+        }
+    });
+    let image = json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "aW1hZ2U="
+        }
+    });
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_document",
+                "content": [
+                    {"type": "text", "text": "content ready"},
+                    image.clone(),
+                    document.clone()
+                ]
+            }]
+        }],
+        "max_tokens": 1024
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::AnthropicMessages,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    assert_eq!(
+        output["messages"][0]["content"][0]["content"],
+        json!([
+            {"type": "text", "text": "content ready"},
+            image,
+            document
+        ])
+    );
+    Ok(())
+}
+
+// Verifies provider-managed Anthropic file IDs are not reused as OpenAI file IDs.
+#[test]
+fn anthropic_tool_result_file_id_does_not_become_openai_file_id() -> TestResult {
+    let engine = TranslationEngine::default();
+    let document = json!({
+        "type": "document",
+        "source": {
+            "type": "file",
+            "file_id": "file_anthropic_123"
+        }
+    });
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_document",
+                "content": [document.clone()]
+            }]
+        }],
+        "max_tokens": 1024
+    });
+
+    let translated = engine.translate_request(
+        WireFormat::AnthropicMessages,
+        WireFormat::OpenAiChat,
+        &body,
+        &TranslationPolicy::default(),
+    )?;
+
+    assert_eq!(translated.body["messages"][1]["content"][0]["type"], "text");
+    let recovered: Value = serde_json::from_str(
+        translated.body["messages"][1]["content"][0]["text"]
+            .as_str()
+            .ok_or("file fallback should be text")?,
+    )?;
+    assert_eq!(recovered, document);
+    assert!(translated.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message == "OpenAI Chat codec could not map file content"
+    }));
+    Ok(())
+}
+
+// Verifies parallel tool results preserve ordering and obey strict conversion policy.
+#[test]
+fn anthropic_parallel_multimodal_tool_results_preserve_order_and_policy() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_image",
+                    "content": [
+                        {"type": "text", "text": "image ready"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aW1hZ2U="
+                            }
+                        }
+                    ]
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_document",
+                    "content": [
+                        {"type": "text", "text": "document ready"},
+                        {
+                            "type": "document",
+                            "title": "report.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "ZG9jdW1lbnQ="
+                            }
+                        }
+                    ]
+                }
+            ]
+        }],
+        "max_tokens": 1024
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(
+        output["messages"],
+        json!([
+            {"role": "tool", "tool_call_id": "toolu_image", "content": "image ready"},
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_document",
+                "content": "document ready"
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aW1hZ2U="}
+                    },
+                    {
+                        "type": "file",
+                        "file": {"file_data": "ZG9jdW1lbnQ=", "filename": "report.pdf"}
+                    }
+                ]
+            }
+        ])
+    );
+    let policy = TranslationPolicy {
+        lossy_conversion_policy: LossyConversionPolicy::Reject,
+        ..TranslationPolicy::default()
+    };
+
+    let error = match engine.translate_request(
+        WireFormat::AnthropicMessages,
+        WireFormat::OpenAiChat,
+        &body,
+        &policy,
+    ) {
+        Ok(_) => panic!("multimodal tool result should be rejected by strict policy"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), "LossyConversion");
     Ok(())
 }
 
@@ -931,6 +1138,104 @@ fn responses_json_schema_text_format_maps_to_chat_response_format() -> TestResul
         })
     );
     Ok(())
+}
+
+// Verifies Chat response_format JSON schema fields flatten into Responses text.format.
+#[test]
+fn chat_json_schema_response_format_maps_to_responses_text_format() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "Return JSON"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "description": "A structured answer",
+                "schema": {"type": "object"},
+                "strict": true
+            }
+        }
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(
+        output["text"]["format"],
+        json!({
+            "type": "json_schema",
+            "name": "answer",
+            "description": "A structured answer",
+            "schema": {"type": "object"},
+            "strict": true
+        })
+    );
+    Ok(())
+}
+
+// Verifies nested fields cannot override the Responses format discriminator.
+#[test]
+fn chat_json_schema_response_format_ignores_nested_type_override() -> TestResult {
+    let output = translate_chat_response_format_to_responses(json!({
+        "type": "json_schema",
+        "json_schema": {
+            "type": "text",
+            "name": "answer",
+            "description": "A structured answer",
+            "schema": {"type": "object"},
+            "strict": true
+        }
+    }))?;
+
+    assert_eq!(
+        output,
+        json!({
+            "type": "json_schema",
+            "name": "answer",
+            "description": "A structured answer",
+            "schema": {"type": "object"},
+            "strict": true
+        })
+    );
+    Ok(())
+}
+
+// Verifies incomplete JSON schema wrappers remain unchanged instead of being partially flattened.
+#[test]
+fn chat_empty_json_schema_wrapper_is_preserved() -> TestResult {
+    let response_format = json!({"type": "json_schema", "json_schema": {}});
+
+    assert_eq!(
+        translate_chat_response_format_to_responses(response_format.clone())?,
+        response_format
+    );
+    Ok(())
+}
+
+fn translate_chat_response_format_to_responses(
+    response_format: Value,
+) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let body = json!({
+        "model": "gpt-5",
+        "messages": [{"role": "user", "content": "Return JSON"}],
+        "response_format": response_format
+    });
+    let output = TranslationEngine::default()
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+    Ok(output["text"]["format"].clone())
 }
 
 // Verifies OpenAI system/developer/reasoning fields map to Anthropic request fields.

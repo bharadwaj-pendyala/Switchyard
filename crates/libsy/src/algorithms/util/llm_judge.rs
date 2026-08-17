@@ -13,15 +13,16 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use switchyard_protocol::{
-    AggLlmResponse, InstructionBlock, LlmRequest, Message, OutputParams, Role, completion_text,
+    AggLlmResponse, InstructionBlock, LlmRequest, Message, ModelId, OutputParams, Role,
+    completion_text,
 };
 
 use super::classifier_contract::ClassifierContract;
-use crate::core::algorithm::{Driver, LlmTarget};
+use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier};
 use crate::core::state::State;
 use crate::{LibsyError, Result};
-use switchyard_protocol::{Decision, LlmClientError, Request, Response};
+use switchyard_protocol::{LlmClientError, Request, Response};
 
 /// Builds the classifier-specific message view presented to a structured judge.
 pub(crate) trait ClassifierInput: Send + Sync {
@@ -61,9 +62,19 @@ where
     fn decode(
         &self,
         response: &AggLlmResponse,
-        _contract: &ClassifierContract,
+        contract: &ClassifierContract,
     ) -> Result<Self::Verdict> {
-        parse_json_verdict(response)
+        if !contract.validates_locally() {
+            return parse_json_verdict(response);
+        }
+        let verdict = parse_json_verdict::<Value>(response)?;
+        contract.validate_verdict(&verdict)?;
+        serde_json::from_value(verdict).map_err(|error| LibsyError::AlgorithmError {
+            message: format!(
+                "judge reply did not parse as {}: {error}",
+                std::any::type_name::<Self::Verdict>()
+            ),
+        })
     }
 }
 
@@ -192,7 +203,7 @@ pub trait JudgePolicy: Send + Sync {
 /// A classifier that calls one judge target and routes through its verdict policy.
 pub struct JudgeClassifier<J, P> {
     judge: J,
-    target: LlmTarget,
+    target: ModelId,
     policy: P,
 }
 
@@ -202,7 +213,7 @@ where
     P: JudgePolicy<Verdict = J::Verdict>,
 {
     /// Combines a judge target with a verdict policy.
-    pub fn new(judge: J, target: LlmTarget, policy: P) -> Self {
+    pub fn new(judge: J, target: ModelId, policy: P) -> Self {
         Self {
             judge,
             target,
@@ -223,16 +234,14 @@ where
         request: &Request,
         driver: &Driver,
     ) -> Option<J::Verdict> {
-        let judge_model = self.target.semantic_name.as_str();
+        let judge_model = self.target.as_str();
 
+        tracing::info!(target = judge_model, "consulting llm judge");
         let response = driver
             .call_model(
                 self.judge.build_request(state, request),
-                Decision::new(
-                    self.target.semantic_name.to_string(),
-                    Some("llm judge consultation".to_string()),
-                    false,
-                ),
+                vec![self.target.clone()],
+                false,
             )
             .await
             .inspect_err(|error| report_fail_open(judge_model, error, libsy_error_reason(error)))
@@ -303,7 +312,7 @@ where
             return Err(LibsyError::AlgorithmError {
                 message: format!(
                     "judge classifier for target {:?} requires a driver to call it",
-                    self.target.semantic_name
+                    self.target
                 ),
             });
         };
@@ -352,6 +361,11 @@ mod tests {
         ok: bool,
     }
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct ScoreVerdict {
+        score: f64,
+    }
+
     struct TestJudge;
 
     impl Judge for TestJudge {
@@ -375,20 +389,14 @@ mod tests {
                 "no-verdict"
             };
             Classification::Scores(vec![Score {
-                target: target.to_string(),
+                target: ModelId::from(target),
                 confidence: 1.0,
             }])
         }
     }
 
     fn classifier() -> JudgeClassifier<TestJudge, TestPolicy> {
-        JudgeClassifier::new(
-            TestJudge,
-            LlmTarget {
-                semantic_name: "judge".to_string(),
-            },
-            TestPolicy,
-        )
+        JudgeClassifier::new(TestJudge, ModelId::from("judge"), TestPolicy)
     }
 
     fn request() -> Request {
@@ -421,6 +429,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn typed_decoder_enforces_a_json_object_contract_locally() -> Result<()> {
+        use super::super::classifier_contract::{
+            ClassifierContractConfig, ClassifierResponseFormat,
+        };
+
+        let config = ClassifierContractConfig::default()
+            .with_response_format_type(ClassifierResponseFormat::JsonObject);
+        let contract = ClassifierContract::from_config(
+            &config,
+            "Return one JSON score.",
+            r#"{
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ScoreVerdict",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"score": {"type": "number"}},
+                        "required": ["score"],
+                        "additionalProperties": false
+                    }
+                }
+            }"#,
+        )?;
+        let decoder = SerdeDecoder::<ScoreVerdict>::new();
+
+        let error = decoder
+            .decode(
+                &text_response(None, r#"{"score":0.5,"unexpected":true}"#),
+                &contract,
+            )
+            .expect_err("an extra property should fail the local schema");
+
+        assert!(error.to_string().contains("did not match response_schema"));
+        assert_eq!(
+            decoder.decode(&text_response(None, r#"{"score":0.5}"#), &contract)?,
+            ScoreVerdict { score: 0.5 }
+        );
+        Ok(())
+    }
+
     fn buffered(completion: &str) -> Response {
         Response {
             llm_response: LlmResponse::Agg(text_response(None, completion)),
@@ -450,7 +499,7 @@ mod tests {
         }
     }
 
-    fn selected(classification: Classification) -> Result<String> {
+    fn selected(classification: Classification) -> Result<ModelId> {
         classification
             .argmax(false)?
             .map(|score| score.target)
@@ -460,7 +509,7 @@ mod tests {
     }
 
     /// Serves the single offloaded judge call with `reply` through a standalone step receiver.
-    async fn score_served_with(reply: Result<Response>) -> Result<String> {
+    async fn score_served_with(reply: Result<Response>) -> Result<ModelId> {
         let (driver, step_rx) = Driver::new("test");
         let mut steps = tokio_stream::wrappers::ReceiverStream::new(step_rx);
         let classifier = classifier();

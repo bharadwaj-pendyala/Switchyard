@@ -3,12 +3,12 @@
 
 """Native Rust Switchyard server host."""
 
-from __future__ import annotations
-
 from os import PathLike
 from typing import TYPE_CHECKING, Any, final
 
-from switchyard_rust.core import _load_native
+from typing_extensions import Self
+
+from switchyard_rust._native import load_native
 
 if TYPE_CHECKING:
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     class Server:
         """Running loopback instance of the native Switchyard server."""
 
-        def __init__(self, config: str | PathLike[str], *, port: int = 0) -> None: ...
+        def __init__(self, config: str | PathLike[str], port: int = 0) -> None: ...
 
         @property
         def port(self) -> int: ...
@@ -24,9 +24,11 @@ if TYPE_CHECKING:
         @property
         def base_url(self) -> str: ...
 
-        def close(self, *, timeout_secs: float = 2.0) -> None: ...
+        def caller_auth_kind(self, model: str) -> str | None: ...
 
-        def __enter__(self) -> Server: ...
+        def close(self, timeout_secs: float = 2.0) -> None: ...
+
+        def __enter__(self) -> Self: ...
 
         def __exit__(
             self,
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
 
 def __getattr__(name: str) -> object:
     if name == "Server":
-        native: Any = _load_native()
+        native: Any = load_native()
         return native.server.Server
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

@@ -13,7 +13,7 @@ use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
-    Decision, LlmRequest, LlmResponse, Metadata, Request, Response, RoutedLlmClient,
+    LlmRequest, LlmResponse, Metadata, ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
     WireFormat, decode_aggregated_response, decode_request, decode_stream,
@@ -26,12 +26,8 @@ use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::raw::RawResponse;
 
-// TODO: Why is this here? What does it do?
-// Headers this client owns or that are hop-by-hop; never forwarded from the
-// caller's metadata. Auth/version/content-type are set by the backend or the
-// JSON body, so a forwarded copy would either be ignored or conflict. Compared
-// case-insensitively. Aligns with `_SENSITIVE_HEADERS` in the Python
-// `switchyard/lib/request_metadata.py` forwarding logic.
+// Headers this client owns or that are hop-by-hop. Backends apply an explicitly
+// enabled caller credential after generic metadata forwarding skips these.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
@@ -42,6 +38,8 @@ const RESERVED_HEADERS: &[&str] = &[
     "cookie",
     "set-cookie",
     "x-api-key",
+    "chatgpt-account-id",
+    "x-openai-fedramp",
     "anthropic-beta",
     "anthropic-version",
     "content-type",
@@ -56,7 +54,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// pin a wire format, plus any `other_backends` reachable over additional formats.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
-    model_name: String,
+    model_name: ModelId,
     default_backend: Backend,
     other_backends: Option<Vec<Backend>>,
 }
@@ -65,7 +63,7 @@ impl ModelConfig {
     /// A model named `model_name` served by `default_backend`, optionally reachable
     /// over additional wire formats via `other_backends`.
     pub fn new(
-        model_name: impl Into<String>,
+        model_name: impl Into<ModelId>,
         default_backend: Backend,
         other_backends: Option<Vec<Backend>>,
     ) -> Self {
@@ -86,20 +84,33 @@ impl ModelConfig {
 /// [`reqwest::Client`], and decodes the response back to the neutral IR (buffered
 /// or streamed).
 pub struct TranslatingLlmClient {
-    model_to_config: HashMap<String, ModelConfig>,
+    model_to_config: HashMap<ModelId, ModelConfig>,
     client: reqwest::Client,
+    forward_auth_client: reqwest::Client,
 }
 
 impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
     pub fn new(model_configs: &[ModelConfig]) -> Result<Self> {
-        let client =
-            reqwest::Client::builder()
-                .build()
-                .map_err(|error| LlmClientError::Transport {
-                    source: Box::new(error),
-                })?;
+        for config in model_configs {
+            config
+                .default_backend
+                .validate_extra_headers(&config.model_name)?;
+            for backend in config.other_backends.iter().flatten() {
+                backend.validate_extra_headers(&config.model_name)?;
+            }
+        }
+        let build_client = |builder: reqwest::ClientBuilder| {
+            builder.build().map_err(|error| LlmClientError::Transport {
+                source: Box::new(error),
+            })
+        };
+        let client = build_client(reqwest::Client::builder())?;
+        // A redirect could move provider-specific headers to another origin.
+        // Forwarded credentials are sent only to the configured URL.
+        let forward_auth_client =
+            build_client(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))?;
         let model_to_config = model_configs
             .iter()
             .map(|config| (config.model_name.clone(), config.clone()))
@@ -108,13 +119,14 @@ impl TranslatingLlmClient {
         Ok(Self {
             model_to_config,
             client,
+            forward_auth_client,
         })
     }
 
     /// The backend serving `model` over `format` — the default backend when its
     /// format matches, otherwise a matching entry in `other_backends`; `None` when
     /// the model is unknown or has no backend for `format`.
-    pub fn backend_for(&self, model: &str, format: WireFormat) -> Option<&Backend> {
+    pub fn backend_for(&self, model: &ModelId, format: WireFormat) -> Option<&Backend> {
         self.model_to_config.get(model).and_then(|config| {
             if config.default_backend.wire_format() == format {
                 Some(&config.default_backend)
@@ -128,7 +140,7 @@ impl TranslatingLlmClient {
     }
 
     /// Whether `model` has an Anthropic backend that supports token counting.
-    pub fn supports_count_tokens(&self, model: &str) -> bool {
+    pub fn supports_count_tokens(&self, model: &ModelId) -> bool {
         self.backend_for(model, WireFormat::AnthropicMessages)
             .is_some()
     }
@@ -137,17 +149,18 @@ impl TranslatingLlmClient {
     ///
     /// Returns an error when the model has no Anthropic backend or the upstream
     /// request fails or returns invalid JSON.
-    pub async fn count_tokens(&self, model: &str, request: Request) -> Result<Value> {
+    pub async fn count_tokens(&self, model: &ModelId, request: Request) -> Result<Value> {
         let backend = self
             .backend_for(model, WireFormat::AnthropicMessages)
             .ok_or_else(|| LlmClientError::Configuration {
                 message: format!("model {model} has no Anthropic backend for count_tokens"),
             })?;
         let Request {
-            llm_request,
+            mut llm_request,
             metadata,
             ..
         } = request;
+        llm_request.model = Some(model.to_string());
         let http_response = self
             .send_encoded(
                 backend,
@@ -171,9 +184,9 @@ impl TranslatingLlmClient {
         })
     }
 
-    /// Encode `llm_request` (its model restamped to `model`) for `wire_format`,
-    /// POST it to `url` with the request's forwarded headers plus the backend's
-    /// static headers and auth, and return the successful upstream response. A
+    /// Encode `llm_request` for `wire_format`, POST it to `url` with the request's
+    /// forwarded headers plus the backend's static headers and auth, and return the
+    /// successful upstream response. A
     /// buffered response is fully collected within the retry boundary; a streamed
     /// response is returned as soon as its successful headers arrive. A non-success
     /// status maps to a typed error — a 400 is classified as a context-window
@@ -186,13 +199,11 @@ impl TranslatingLlmClient {
         &self,
         backend: &Backend,
         wire_format: WireFormat,
-        mut llm_request: LlmRequest,
+        llm_request: LlmRequest,
         metadata: Option<&Metadata>,
-        model: &str,
+        model: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
-        // The resolved name is the upstream model id (per the crate contract).
-        llm_request.model = Some(model.to_string());
         let mut body = encode_request(&llm_request, wire_format)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -224,7 +235,7 @@ impl TranslatingLlmClient {
             let span = tracing::debug_span!(
                 target: "libsy",
                 "libsy.upstream_attempt",
-                model,
+                model = %model,
                 wire_format = %wire_format,
                 attempt = attempt + 1,
                 max_attempts,
@@ -276,11 +287,17 @@ impl TranslatingLlmClient {
         backend: &Backend,
         body: &Value,
         metadata: Option<&Metadata>,
-        model: &str,
+        model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        let builder = self.client.post(url).json(body);
+        let client = if backend.is_forwarding_auth() {
+            &self.forward_auth_client
+        } else {
+            &self.client
+        };
+        let builder = client.post(url).json(body);
         let builder = forward_metadata_headers(builder, metadata);
+        let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
 
@@ -332,11 +349,12 @@ impl TranslatingLlmClient {
                 });
             }
         };
+        let body = backend.redact_forwarded_auth(body, metadata);
         metrics::record_upstream_attempt(Some(status.as_u16()));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
                 LlmClientError::ContextWindowExceeded {
-                    model: model.to_string(),
+                    model: model.clone(),
                     message: body,
                 }
             } else {
@@ -363,37 +381,36 @@ impl TranslatingLlmClient {
     pub async fn call_rewrite_model(
         &self,
         request: Request,
-        model_name: Option<&str>,
+        model_name: Option<&ModelId>,
     ) -> Result<Response> {
-        // Own the request's parts so the model can be set without a `mut` param
-        // and without cloning the messages. `raw_request` is unused here.
         let Request {
-            llm_request,
+            mut llm_request,
             metadata,
             ..
         } = request;
 
-        let model = model_name
-            .map(str::to_string)
-            .or_else(|| llm_request.model.clone())
+        let model_id = model_name
+            .cloned()
+            .or_else(|| llm_request.model.map(ModelId::from))
             .ok_or_else(|| LlmClientError::InvalidRequest {
                 message: "no model given".to_string(),
             })?;
+        llm_request.model = Some(model_id.to_string());
 
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
             self.model_to_config
-                .get(&model)
+                .get(&model_id)
                 .map(|config| config.default_backend.wire_format())
                 .ok_or_else(|| LlmClientError::Configuration {
-                    message: format!("no backend configured for model {model:?}"),
+                    message: format!("no backend configured for model {model_id:?}"),
                 })?,
         );
-        let backend =
-            self.backend_for(&model, wire_format)
-                .ok_or_else(|| LlmClientError::Configuration {
-                    message: format!("model {model:?} has no backend for format {wire_format}"),
-                })?;
+        let backend = self.backend_for(&model_id, wire_format).ok_or_else(|| {
+            LlmClientError::Configuration {
+                message: format!("model {model_id:?} has no backend for format {wire_format}"),
+            }
+        })?;
 
         let http_response = self
             .send_encoded(
@@ -401,7 +418,7 @@ impl TranslatingLlmClient {
                 wire_format,
                 llm_request,
                 metadata.as_ref(),
-                &model,
+                &model_id,
                 UpstreamEndpoint::Completion,
             )
             .await?;
@@ -460,7 +477,7 @@ impl TranslatingLlmClient {
         &self,
         raw_http_request: Value,
         http_headers: Option<http::HeaderMap>,
-        model: Option<&str>,
+        model: Option<&ModelId>,
         wire_format: WireFormat,
     ) -> Result<RawResponse> {
         let llm_request = decode_request(wire_format, &raw_http_request)
@@ -469,7 +486,7 @@ impl TranslatingLlmClient {
         // one, else the request's own model. Mirrors `call_rewrite_model`'s own
         // resolution so the response names whoever answered.
         let served_model = model
-            .map(str::to_string)
+            .map(ModelId::to_string)
             .or_else(|| llm_request.model.clone());
 
         let request = Request {
@@ -505,9 +522,8 @@ impl TranslatingLlmClient {
 
 #[async_trait]
 impl RoutedLlmClient for TranslatingLlmClient {
-    async fn call(&self, request: Request, decision: Decision) -> Result<Response> {
-        let model_name = Some(decision.selected_model_id());
-        self.call_rewrite_model(request, model_name).await
+    async fn call(&self, request: Request) -> Result<Response> {
+        self.call_rewrite_model(request, None).await
     }
 }
 
@@ -626,7 +642,7 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers, skipping the reserved set.
+// Forwards caller-supplied metadata headers except credentials and client-owned headers.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
@@ -643,7 +659,7 @@ fn forward_metadata_headers(
     builder
 }
 
-// Adds the backend's static per-call headers.
+// Adds the backend's custom per-call headers.
 fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> RequestBuilder {
     for (name, value) in backend.extra_headers() {
         builder = builder.header(name, value);
@@ -664,8 +680,7 @@ fn set_json_model(body: &mut Value, model: &str) {
 // later turns from an Anthropic one. Clients such as Claude Code send
 // `context_management` on every turn, so the Anthropic leg must strip it or the
 // upstream rejects the request (for example `clear_thinking_20251015` strategy
-// requires `thinking` to be enabled or adaptive). Mirrors
-// `switchyard-components`' `strip_anthropic_incompatible_fields`.
+// requires `thinking` to be enabled or adaptive).
 fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
@@ -679,8 +694,7 @@ fn strip_anthropic_incompatible_fields(body: &mut Value) {
 // turns of a session from an OpenAI-format target whose thinking blocks are
 // unsigned, so the Anthropic leg must drop them or the upstream rejects the
 // request. Bedrock enforces this (surfacing as a SigV4 signature mismatch) where
-// Azure-hosted Anthropic currently does not. Mirrors `switchyard-components`'
-// `strip_unsigned_thinking_blocks`.
+// Azure-hosted Anthropic currently does not.
 fn strip_unsigned_thinking_blocks(body: &mut Value) {
     let Value::Object(object) = body else {
         return;
@@ -815,6 +829,7 @@ mod tests {
         HttpBackendConfig {
             base_url: base_url.to_string(),
             api_key: Some("secret".to_string()),
+            forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,
@@ -1021,15 +1036,19 @@ mod tests {
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let client = TranslatingLlmClient::new(&chat_map("https://example.test/v1"))?;
         // "gpt" is served over OpenAI Chat only; other formats and models miss.
-        assert!(client.backend_for("gpt", WireFormat::OpenAiChat).is_some());
         assert!(
             client
-                .backend_for("gpt", WireFormat::AnthropicMessages)
+                .backend_for(&ModelId::from("gpt"), WireFormat::OpenAiChat)
+                .is_some()
+        );
+        assert!(
+            client
+                .backend_for(&ModelId::from("gpt"), WireFormat::AnthropicMessages)
                 .is_none()
         );
         assert!(
             client
-                .backend_for("missing", WireFormat::OpenAiChat)
+                .backend_for(&ModelId::from("missing"), WireFormat::OpenAiChat)
                 .is_none()
         );
         Ok(())
@@ -1041,7 +1060,7 @@ mod tests {
         let client = TranslatingLlmClient::new(&[])?;
         // Arg "b" is looked up (and reported), not the request's "a".
         let Err(error) = client
-            .call_rewrite_model(request_for(Some("a"), false), Some("b"))
+            .call_rewrite_model(request_for(Some("a"), false), Some(&ModelId::from("b")))
             .await
         else {
             panic!("expected an error");
@@ -1215,7 +1234,10 @@ mod tests {
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
         // Inbound model differs from the map key / resolved model.
         client
-            .call_rewrite_model(request_for(Some("switchyard"), false), Some("gpt"))
+            .call_rewrite_model(
+                request_for(Some("switchyard"), false),
+                Some(&ModelId::from("gpt")),
+            )
             .await?;
         // The body_partial_json matcher asserts the upstream saw model "gpt".
         Ok(())
@@ -1260,7 +1282,12 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(raw, None, Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await?;
         Ok(())
     }
@@ -1329,7 +1356,12 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(raw, None, Some("claude"), WireFormat::AnthropicMessages)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
             .await?;
         Ok(())
     }
@@ -1371,7 +1403,12 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(raw, None, Some("claude"), WireFormat::AnthropicMessages)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
             .await?;
         Ok(())
     }
@@ -1433,7 +1470,12 @@ mod tests {
         });
 
         let response = client
-            .call_rewrite_model_raw(raw, None, Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await?;
         assert!(matches!(response, RawResponse::Stream(_)));
         Ok(())
@@ -1643,7 +1685,7 @@ mod tests {
 
         let context_window = AttemptFailure {
             error: LlmClientError::ContextWindowExceeded {
-                model: "gpt".to_string(),
+                model: ModelId::from("gpt"),
                 message: "too long".to_string(),
             },
             status: Some(400),
@@ -1685,9 +1727,8 @@ mod tests {
         client.client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(10))
             .build()?;
-        let decision = fixed_decision("gpt");
 
-        let Err(error) = client.call(request_for(None, false), decision).await else {
+        let Err(error) = client.call(request_for(Some("gpt"), false)).await else {
             panic!("expected a timeout");
         };
         let LlmClientError::Timeout { source } = error else {
@@ -1784,14 +1825,10 @@ mod tests {
         Ok(())
     }
 
-    fn fixed_decision(target: &str) -> Decision {
-        Decision::new(target, None, true)
-    }
-
-    // Exercises the `RoutedLlmClient` impl: `call` resolves the upstream model from the
-    // decision (the request carries none) and round-trips a buffered response.
+    // Exercises the `RoutedLlmClient` impl: `call` uses the model already materialized in the
+    // request and round-trips a buffered response.
     #[tokio::test]
-    async fn routed_llm_client_serves_the_decision_model()
+    async fn routed_llm_client_serves_the_request_model()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1810,9 +1847,7 @@ mod tests {
             .await;
 
         let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
-        let decision = fixed_decision("gpt");
-        // Called through the trait; the request has no model, so "gpt" comes from the decision.
-        let response = client.call(request_for(None, false), decision).await?;
+        let response = client.call(request_for(Some("gpt"), false)).await?;
         let agg = response.llm_response.into_agg().await?;
         assert_eq!(completion_text(&agg), "routed hi");
         Ok(())
@@ -1823,7 +1858,12 @@ mod tests {
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let client = TranslatingLlmClient::new(&[])?;
         let Err(error) = client
-            .call_rewrite_model_raw(json!("invalid"), None, Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                json!("invalid"),
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await
         else {
             panic!("expected request translation to fail");
@@ -1863,7 +1903,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(raw, None, Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await?
         else {
             panic!("expected a buffered response");
@@ -1899,7 +1944,12 @@ mod tests {
             "stream": true
         });
         let RawResponse::Stream(stream) = client
-            .call_rewrite_model_raw(raw, None, Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await?
         else {
             panic!("expected a streamed response");
@@ -1947,7 +1997,12 @@ mod tests {
         // Matchers assert the forwarded x-request-id survives and reserved
         // authorization is the backend's, not the client's.
         client
-            .call_rewrite_model_raw(raw, Some(headers), Some("gpt"), WireFormat::OpenAiChat)
+            .call_rewrite_model_raw(
+                raw,
+                Some(headers),
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
             .await?;
         Ok(())
     }
